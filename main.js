@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         B站评论一键@（多分组 / 中奖楼 / 绑定指定楼 / 可选钩子）
-// @namespace    http://tampermonkey.net/
-// @version      3.8
-// @description  一键@：支持“多分组”管理与多选合并（可去重、可预览）；模式含 顶层直发 / 中奖楼（占楼→延迟→楼中楼分片@，含重试） / 绑定指定楼（链接或rpid），并可选页面钩子自动捕捉root/parent。每条最多@10人，自动分片。
+// @name         B站评论一键@（多分组 / 中奖楼 / 绑定指定楼 / 页面钩子）
+// @namespace    https://tampermonkey.net/
+// @version      4.0
+// @description  一键@（多分组）：顶层直发 / 中奖楼（占楼→延迟→楼中楼@，含重试） / 绑定指定楼（rpid或评论链接）；默认启用页面钩子捕捉root/parent。每条最多@10人，自动分片。
 // @author       Gemini & User
 // @match        https://www.bilibili.com/video/*
 // @grant        GM_xmlhttpRequest
@@ -20,12 +20,11 @@
 (function () {
   "use strict";
 
-  // ========= 1) 键名 & 常量 =========
+  // ========= 常量 & 存储键 =========
   const AT_LIMIT_PER_COMMENT = 10;
 
-  // 鉴权 / 旧版本兼容
+  // 鉴权 & 模式
   const GM_KEY_SESSDATA = "BILI_SESSDATA";
-  const GM_KEY_LEGACY_GROUP = "BILI_AT_GROUP_USERNAMES"; // v3.6单名单
   const GM_KEY_MODE = "BILI_AT_REPLY_MODE"; // 'top'|'threadSelf'|'threadBind'
   const GM_KEY_THREAD_PREFIX = "BILI_AT_THREAD_PREFIX";
   const GM_KEY_THREAD_DELAY_MS = "BILI_AT_THREAD_DELAY_MS";
@@ -34,7 +33,7 @@
   const GM_KEY_BIND_ROOT_RPID = "BILI_AT_BIND_ROOT_RPID";
   const GM_KEY_HOOK_ENABLED = "BILI_AT_ENABLE_PAGE_HOOK";
 
-  // 分组系统（v3.8+）
+  // 分组
   const GM_KEY_GROUPS = "BILI_AT_GROUPS";              // { [groupName]: string[] }
   const GM_KEY_GROUP_ORDER = "BILI_AT_GROUP_ORDER";    // string[]
   const GM_KEY_ACTIVE_GROUPS = "BILI_AT_ACTIVE_GROUPS";// string[]
@@ -42,71 +41,46 @@
 
   const ReplyMode = { TOP: "top", THREAD_SELF: "threadSelf", THREAD_BIND: "threadBind" };
 
-  // ========= 2) 初始化 & 兼容迁移 =========
-  initDefaults();
-  migrateFromLegacyIfNeeded();
+  // ========= 初始化 =========
+  if (!GM_getValue(GM_KEY_MODE)) GM_setValue(GM_KEY_MODE, ReplyMode.TOP);
+  if (!GM_getValue(GM_KEY_THREAD_PREFIX)) GM_setValue(GM_KEY_THREAD_PREFIX, "中奖名单：");
+  if (GM_getValue(GM_KEY_THREAD_DELAY_MS) == null) GM_setValue(GM_KEY_THREAD_DELAY_MS, 2500);
+  if (GM_getValue(GM_KEY_RETRY_TIMES) == null) GM_setValue(GM_KEY_RETRY_TIMES, 3);
+  if (GM_getValue(GM_KEY_RETRY_BASE_MS) == null) GM_setValue(GM_KEY_RETRY_BASE_MS, 1200);
+  if (GM_getValue(GM_KEY_HOOK_ENABLED) == null) GM_setValue(GM_KEY_HOOK_ENABLED, true); // 默认开启
+  if (!GM_getValue(GM_KEY_GROUPS)) GM_setValue(GM_KEY_GROUPS, {});
+  if (!GM_getValue(GM_KEY_GROUP_ORDER)) GM_setValue(GM_KEY_GROUP_ORDER, []);
+  if (GM_getValue(GM_KEY_DEDUP) == null) GM_setValue(GM_KEY_DEDUP, true);
+  if (!GM_getValue(GM_KEY_ACTIVE_GROUPS)) GM_setValue(GM_KEY_ACTIVE_GROUPS, []); // 初始未选择
 
-  function initDefaults() {
-    if (!GM_getValue(GM_KEY_MODE)) GM_setValue(GM_KEY_MODE, ReplyMode.TOP);
-    if (!GM_getValue(GM_KEY_THREAD_PREFIX)) GM_setValue(GM_KEY_THREAD_PREFIX, "中奖名单：");
-    if (GM_getValue(GM_KEY_THREAD_DELAY_MS) == null) GM_setValue(GM_KEY_THREAD_DELAY_MS, 2500);
-    if (GM_getValue(GM_KEY_RETRY_TIMES) == null) GM_setValue(GM_KEY_RETRY_TIMES, 3);
-    if (GM_getValue(GM_KEY_RETRY_BASE_MS) == null) GM_setValue(GM_KEY_RETRY_BASE_MS, 1200);
-    if (GM_getValue(GM_KEY_HOOK_ENABLED) == null) GM_setValue(GM_KEY_HOOK_ENABLED, false);
-    if (!GM_getValue(GM_KEY_GROUPS)) GM_setValue(GM_KEY_GROUPS, {});
-    if (!GM_getValue(GM_KEY_GROUP_ORDER)) GM_setValue(GM_KEY_GROUP_ORDER, []);
-    if (GM_getValue(GM_KEY_DEDUP) == null) GM_setValue(GM_KEY_DEDUP, true);
-  }
-
-  function migrateFromLegacyIfNeeded() {
-    const groups = GM_getValue(GM_KEY_GROUPS, {});
-    const order = GM_getValue(GM_KEY_GROUP_ORDER, []);
-    const legacy = GM_getValue(GM_KEY_LEGACY_GROUP, []);
-    if (Array.isArray(legacy) && legacy.length > 0 && Object.keys(groups).length === 0) {
-      groups["default"] = legacy.slice();
-      order.push("default");
-      GM_setValue(GM_KEY_GROUPS, groups);
-      GM_setValue(GM_KEY_GROUP_ORDER, order);
-      GM_setValue(GM_KEY_ACTIVE_GROUPS, ["default"]);
-      GM_notification({ title: "B站一键@ 分组迁移", text: "已将旧名单迁移为分组：default", timeout: 5000 });
-    }
-  }
-
-  // ========= 3) 菜单 =========
+  // ========= 菜单 =========
   GM_registerMenuCommand("1. 设置SESSDATA", setupSessdata);
-  GM_registerMenuCommand("2. 分组：新增/编辑/删除/重命名", groupsManageCenter);
-  GM_registerMenuCommand("3. 分组：选择当前使用分组（可多选）", groupsSelectActive);
+  GM_registerMenuCommand("2. 分组中心：新增/编辑/删除/重命名/排序", groupsManageCenter);
+  GM_registerMenuCommand("3. 分组：选择当前使用（可多选）", groupsSelectActive);
   GM_registerMenuCommand("4. 分组：预览当前选择名单", groupsPreviewActive);
   GM_registerMenuCommand("5. 分组：导入/导出（JSON）", groupsImportExport);
   GM_registerMenuCommand("6. 分组：去重开关（当前：" + (GM_getValue(GM_KEY_DEDUP, true) ? "开" : "关") + "）", toggleDedup);
   GM_registerMenuCommand("7. 模式：切换 顶层/中奖楼/绑定指定楼", switchMode);
-  GM_registerMenuCommand("8. 设置“中奖楼”占楼文案", setupThreadPrefix);
-  GM_registerMenuCommand("9. 中奖楼：设置首发延迟/重试", setupDelayRetry);
-  GM_registerMenuCommand("10. 绑定指定楼：粘贴评论链接或 rpid", setupBindRootRpid);
-  GM_registerMenuCommand("11. （可选）页面钩子：启/停捕捉当前楼 root/parent", togglePageHook);
-  GM_registerMenuCommand("12. 快速创建示例分组（杂/ba/all）", quickCreateSampleGroups);
-  GM_registerMenuCommand("13. 立即执行一键@（按当前模式+分组）", () => routeSend({ source: "menu" }));
+  GM_registerMenuCommand("8. 中奖楼：占楼文案/延迟/重试设置", setupThreadConfig);
+  GM_registerMenuCommand("9. 绑定指定楼：粘贴评论链接或 rpid", setupBindRootRpid);
+  GM_registerMenuCommand("10. 页面钩子：启/停（当前：" + (GM_getValue(GM_KEY_HOOK_ENABLED, true) ? "开" : "关") + "）", togglePageHook);
+  GM_registerMenuCommand("11. 立即执行一键@（按当前模式+分组）", () => routeSend({ source: "menu" }));
 
-  // ========= 4) 通用工具 =========
+  // ========= 通用工具 =========
   function setupSessdata() {
     const cur = GM_getValue(GM_KEY_SESSDATA, "");
-    const val = prompt("请输入 SESSDATA（从浏览器开发者工具Cookie面板复制）", cur);
+    const val = prompt("请输入 SESSDATA（从浏览器开发者工具 Cookie 面板复制）", cur);
     if (val !== null) {
       GM_setValue(GM_KEY_SESSDATA, val.trim());
-      alert("SESSDATA 已" + (val.trim() ? "保存" : "清空"));
+      alert(val.trim() ? "SESSDATA 已保存" : "SESSDATA 已清空");
     }
   }
 
   function parseAtList(str) {
     if (!str) return [];
     const s = String(str).trim();
-    // 1) 优先解析 @Name 形式
     let list = Array.from(s.matchAll(/@([^@\s]+(?:\s*[^@\s]+)*)/g), (m) => m[1].trim()).filter(Boolean);
-    // 2) 兜底：若没找到@，按逗号/空格/换行/分号分割
-    if (list.length === 0) {
-      list = s.split(/[\s,;]+/).map((t) => t.trim()).filter(Boolean);
-    }
-    // 去除首尾标点/多余空格
+    if (list.length === 0) list = s.split(/[\s,;]+/).map((t) => t.trim()).filter(Boolean);
     return list.map((n) => n.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, "").trim()).filter(Boolean);
   }
 
@@ -122,11 +96,7 @@
     let lastErr;
     for (let i = 0; i <= retries; i++) {
       try { return await taskFn(i); }
-      catch (e) {
-        lastErr = e;
-        if (i === retries) break;
-        await sleep(Math.round(baseDelay * Math.pow(factor, i)));
-      }
+      catch (e) { lastErr = e; if (i === retries) break; await sleep(Math.round(baseDelay * Math.pow(factor, i))); }
     }
     throw lastErr;
   }
@@ -137,36 +107,40 @@
     return !onlyPunct.test(str);
   }
 
-  // ========= 5) 分组：数据层 =========
-  function getGroupsObj() { return GM_getValue(GM_KEY_GROUPS, {}); }
-  function getGroupOrder() { return GM_getValue(GM_KEY_GROUP_ORDER, []); }
-  function setGroupsObj(obj) { GM_setValue(GM_KEY_GROUPS, obj); }
-  function setGroupOrder(order) { GM_setValue(GM_KEY_GROUP_ORDER, order); }
-  function ensureGroup(name) {
-    const groups = getGroupsObj(); const order = getGroupOrder();
-    if (!groups[name]) { groups[name] = []; order.push(name); setGroupsObj(groups); setGroupOrder(order); }
-  }
+  // ========= 分组：数据层 =========
+  const getGroupsObj = () => GM_getValue(GM_KEY_GROUPS, {});
+  const getGroupOrder = () => GM_getValue(GM_KEY_GROUP_ORDER, []);
+  const setGroupsObj = (obj) => GM_setValue(GM_KEY_GROUPS, obj);
+  const setGroupOrder = (order) => GM_setValue(GM_KEY_GROUP_ORDER, order);
+
   function addOrUpdateGroup(name, usernames) {
     name = String(name).trim();
     if (!name) throw new Error("分组名不能为空");
-    const groups = getGroupsObj(); const order = getGroupOrder();
+    const groups = getGroupsObj();
+    const order = getGroupOrder();
     groups[name] = Array.from(usernames || []);
     if (!order.includes(name)) order.push(name);
     setGroupsObj(groups); setGroupOrder(order);
   }
+
   function deleteGroup(name) {
-    const groups = getGroupsObj(); const order = getGroupOrder();
+    const groups = getGroupsObj();
+    const order = getGroupOrder();
+    if (!groups[name]) return;
     delete groups[name];
     setGroupsObj(groups);
     setGroupOrder(order.filter((n) => n !== name));
+
     const act = new Set(GM_getValue(GM_KEY_ACTIVE_GROUPS, []));
     if (act.has(name)) {
       act.delete(name);
       GM_setValue(GM_KEY_ACTIVE_GROUPS, Array.from(act));
     }
   }
+
   function renameGroup(oldName, newName) {
-    const groups = getGroupsObj(); const order = getGroupOrder();
+    const groups = getGroupsObj();
+    const order = getGroupOrder();
     if (!groups[oldName]) throw new Error("原分组不存在");
     if (groups[newName]) throw new Error("新分组名已存在");
     groups[newName] = groups[oldName];
@@ -178,8 +152,15 @@
   }
 
   function listGroupsWithCounts() {
-    const groups = getGroupsObj(); const order = getGroupOrder();
-    return order.map((name) => ({ name, count: (groups[name] || []).length }));
+    const groups = getGroupsObj();
+    const order = getGroupOrder();
+    const active = new Set(GM_getValue(GM_KEY_ACTIVE_GROUPS, []));
+    return order.map((name, idx) => ({
+      index: idx + 1,
+      name,
+      count: (groups[name] || []).length,
+      active: active.has(name),
+    }));
   }
 
   function toggleDedup() {
@@ -189,7 +170,8 @@
   }
 
   function aggregateSelectedUsernames() {
-    const groups = getGroupsObj(); const order = getGroupOrder();
+    const groups = getGroupsObj();
+    const order = getGroupOrder();
     let selected = GM_getValue(GM_KEY_ACTIVE_GROUPS, []);
     if (!selected || selected.length === 0) {
       const all = order.flatMap((g) => groups[g] || []);
@@ -199,12 +181,9 @@
       }
       return dedupMaybe(all);
     }
-    // 保持全局顺序：仅保留选中的顺序子序列
     const seq = order.filter((n) => selected.includes(n));
     const merged = [];
-    for (const g of seq) {
-      merged.push(...(groups[g] || []));
-    }
+    for (const g of seq) merged.push(...(groups[g] || []));
     return dedupMaybe(merged);
   }
 
@@ -212,21 +191,20 @@
     if (!GM_getValue(GM_KEY_DEDUP, true)) return list.slice();
     const seen = new Set(); const out = [];
     for (const n of list) {
-      const key = n.trim(); // 精确去重（保留大小写与空格差异已修剪）
-      if (!key) continue;
-      if (seen.has(key)) continue;
+      const key = n.trim();
+      if (!key || seen.has(key)) continue;
       seen.add(key); out.push(key);
     }
     return out;
   }
 
-  // ========= 6) 分组：菜单实现 =========
+  // ========= 分组：菜单实现 =========
   function groupsManageCenter() {
     const items = listGroupsWithCounts();
-    let msg = "【分组中心】\n";
-    msg += "（a）新增分组\n（e）编辑分组\n（d）删除分组\n（r）重命名分组\n（o）调整分组顺序\n\n当前分组：\n";
+    let msg = "【分组中心】\n" +
+      "（a）新增分组\n（e）编辑分组\n（d）删除分组\n（r）重命名分组\n（o）调整分组顺序\n\n当前分组：\n";
     if (items.length === 0) msg += "（暂无分组）\n";
-    else items.forEach((it, idx) => (msg += `  ${idx + 1}. ${it.name}（${it.count} 人）\n`));
+    else items.forEach((it) => (msg += `  ${it.index}. ${it.name}（${it.count} 人）${it.active ? "  [已选]" : ""}\n`));
     const choice = prompt(msg + "\n请输入操作指令（a/e/d/r/o），或留空取消：", "");
     if (!choice) return;
     const c = choice.trim().toLowerCase();
@@ -239,45 +217,61 @@
       const users = parseAtList(listStr);
       addOrUpdateGroup(name, users);
       alert(`已新增分组「${name}」：${users.length} 人`);
-    } else if (c === "e") {
-      if (items.length === 0) return alert("暂无分组可编辑");
-      const idx = prompt("请输入要编辑的分组序号：", "");
-      if (idx === null) return;
-      const i = Number(idx) - 1;
-      if (isNaN(i) || i < 0 || i >= items.length) return alert("序号无效");
-      const name = items[i].name;
+      return;
+    }
+
+    if (["e","d","r","o"].includes(c) && items.length === 0) {
+      alert("暂无分组可操作");
+      return;
+    }
+
+    if (c === "e") {
+      const hint = renderGroupsPrompt("【编辑分组】请选择序号：\n", items);
+      const idxStr = prompt(hint, "");
+      if (idxStr === null) return;
+      const idx = Number(idxStr) - 1;
+      const it = items[idx];
+      if (!it) return alert("序号无效");
       const groups = getGroupsObj();
-      const curStr = (groups[name] || []).map((n) => `@${n}`).join(" ");
-      const listStr = prompt(`编辑分组「${name}」的 @ 名单：`, curStr);
+      const curStr = (groups[it.name] || []).map((n) => `@${n}`).join(" ");
+      const listStr = prompt(`编辑分组「${it.name}」的 @ 名单：`, curStr);
       if (listStr === null) return;
       const users = parseAtList(listStr);
-      addOrUpdateGroup(name, users);
-      alert(`已更新分组「${name}」：${users.length} 人`);
-    } else if (c === "d") {
-      if (items.length === 0) return alert("暂无分组可删除");
-      const idx = prompt("请输入要删除的分组序号：", "");
-      if (idx === null) return;
-      const i = Number(idx) - 1;
-      if (isNaN(i) || i < 0 || i >= items.length) return alert("序号无效");
-      const name = items[i].name;
-      if (!confirm(`确定删除分组「${name}」？该操作不可撤销。`)) return;
-      deleteGroup(name);
+      addOrUpdateGroup(it.name, users);
+      alert(`已更新分组「${it.name}」：${users.length} 人`);
+      return;
+    }
+
+    if (c === "d") {
+      const hint = renderGroupsPrompt("【删除分组】请选择序号：\n", items);
+      const idxStr = prompt(hint, "");
+      if (idxStr === null) return;
+      const idx = Number(idxStr) - 1;
+      const it = items[idx];
+      if (!it) return alert("序号无效");
+      if (!confirm(`确定删除分组「${it.name}」？该操作不可撤销。`)) return;
+      deleteGroup(it.name);
       alert("已删除。");
-    } else if (c === "r") {
-      if (items.length === 0) return alert("暂无分组可重命名");
-      const idx = prompt("请输入要重命名的分组序号：", "");
-      if (idx === null) return;
-      const i = Number(idx) - 1;
-      if (isNaN(i) || i < 0 || i >= items.length) return alert("序号无效");
-      const oldName = items[i].name;
-      const newName = prompt(`将「${oldName}」重命名为：`, oldName);
+      return;
+    }
+
+    if (c === "r") {
+      const hint = renderGroupsPrompt("【重命名分组】请选择序号：\n", items);
+      const idxStr = prompt(hint, "");
+      if (idxStr === null) return;
+      const idx = Number(idxStr) - 1;
+      const it = items[idx];
+      if (!it) return alert("序号无效");
+      const newName = prompt(`将「${it.name}」重命名为：`, it.name);
       if (newName === null) return;
-      try { renameGroup(oldName, newName.trim()); alert("已重命名。"); }
+      try { renameGroup(it.name, newName.trim()); alert("已重命名。"); }
       catch (e) { alert(`失败：${e.message}`); }
-    } else if (c === "o") {
-      if (items.length < 2) return alert("分组数不足以排序");
-      let hint = "请输入新的顺序（以逗号分隔的序号），例如：2,1,3,4\n当前：\n";
-      items.forEach((it, idx) => (hint += `  ${idx + 1}. ${it.name}\n`));
+      return;
+    }
+
+    if (c === "o") {
+      let hint = "【调整分组顺序】请输入新的顺序（以逗号分隔的序号），例如：2,1,3,4\n当前：\n";
+      items.forEach((it) => (hint += `  ${it.index}. ${it.name}\n`));
       const val = prompt(hint, "");
       if (val === null) return;
       const arr = val.split(",").map((t) => Number(t.trim()) - 1);
@@ -287,16 +281,23 @@
       const newOrder = arr.map((i) => items[i].name);
       setGroupOrder(newOrder);
       alert("已调整顺序。");
-    } else {
-      alert("未知指令。");
+      return;
     }
+
+    alert("未知指令。");
+  }
+
+  function renderGroupsPrompt(title, items) {
+    let s = title;
+    items.forEach((it) => (s += `  ${it.index}. ${it.name}（${it.count} 人）${it.active ? "  [已选]" : ""}\n`));
+    return s;
   }
 
   function groupsSelectActive() {
     const items = listGroupsWithCounts();
     if (items.length === 0) return alert("暂无分组，请先新增。");
     let msg = "选择要用于发送的分组（可多选）：\n";
-    items.forEach((it, idx) => (msg += `  ${idx + 1}. ${it.name}（${it.count} 人）\n`));
+    items.forEach((it) => (msg += `  ${it.index}. ${it.name}（${it.count} 人）${it.active ? "  [已选]" : ""}\n`));
     msg += "\n输入：\n - 多个序号用逗号分隔（如 1,3）\n - all = 全部分组\n - 0 = 清空选择\n";
     const input = prompt(msg, "");
     if (input === null) return;
@@ -327,7 +328,7 @@
   }
 
   function groupsImportExport() {
-    const act = prompt("输入 i=导入 / e=导出：", "e");
+    const act = prompt("输入 e=导出 / i=导入：", "e");
     if (act === null) return;
     const c = act.trim().toLowerCase();
     if (c === "e") {
@@ -351,23 +352,13 @@
     }
   }
 
-  function quickCreateSampleGroups() {
-    const sample = {
-      "杂": parseAtList("@Sinlahaley"),
-      "ba": parseAtList("@一团玄兽"),
-      "all": parseAtList("@新世纪水煮鱼@华为很卡@Bydos@Ender2021@okok-nop@yi5456@一团玄兽@我有点小方啊@IE罗罗包@孤独小偷哐哐喵@Uwjdiw"),
-    };
-    const groups = getGroupsObj(); const order = getGroupOrder();
-    for (const [k, v] of Object.entries(sample)) {
-      groups[k] = v;
-      if (!order.includes(k)) order.push(k);
-    }
-    setGroupsObj(groups); setGroupOrder(order);
-    GM_setValue(GM_KEY_ACTIVE_GROUPS, ["all"]);
-    alert("已创建示例分组（杂/ba/all），并将当前使用分组设为：all");
+  function toggleDedup() {
+    const cur = !!GM_getValue(GM_KEY_DEDUP, true);
+    GM_setValue(GM_KEY_DEDUP, !cur);
+    alert(`分组合并去重已${!cur ? "开启" : "关闭"}`);
   }
 
-  // ========= 7) 模式 & 中奖楼配置 =========
+  // ========= 模式 & 配置 =========
   function switchMode() {
     const cur = GM_getValue(GM_KEY_MODE, ReplyMode.TOP);
     const hint = `当前模式：${
@@ -384,20 +375,18 @@
     alert("已切换模式。");
   }
 
-  function setupThreadPrefix() {
-    const cur = GM_getValue(GM_KEY_THREAD_PREFIX, "中奖名单：");
-    const val = prompt("请输入占楼文案（不能是单个标点）：", cur);
-    if (val === null) return;
-    const t = val.trim();
-    if (!isNonPunctuation(t)) return alert("占楼文案不能是空或单个标点。");
-    GM_setValue(GM_KEY_THREAD_PREFIX, t);
-    alert("已保存。");
-  }
-
-  function setupDelayRetry() {
+  function setupThreadConfig() {
+    const curPrefix = GM_getValue(GM_KEY_THREAD_PREFIX, "中奖名单：");
     const curDelay = Number(GM_getValue(GM_KEY_THREAD_DELAY_MS, 2500));
     const curRetry = Number(GM_getValue(GM_KEY_RETRY_TIMES, 3));
     const curBase  = Number(GM_getValue(GM_KEY_RETRY_BASE_MS, 1200));
+
+    const prefix = prompt("请输入占楼文案（不能是单个标点）：", curPrefix);
+    if (prefix === null) return;
+    const t = prefix.trim();
+    if (!isNonPunctuation(t)) return alert("占楼文案不能是空或单个标点。");
+    GM_setValue(GM_KEY_THREAD_PREFIX, t);
+
     const d = prompt("中奖楼：首条楼中楼发送前延迟（毫秒）", String(curDelay)); if (d === null) return;
     const r = prompt("单条失败重试次数（建议3）", String(curRetry)); if (r === null) return;
     const b = prompt("重试基准延迟（毫秒，建议1200）", String(curBase)); if (b === null) return;
@@ -419,13 +408,13 @@
   }
 
   function togglePageHook() {
-    const next = !GM_getValue(GM_KEY_HOOK_ENABLED, false);
+    const next = !GM_getValue(GM_KEY_HOOK_ENABLED, true);
     GM_setValue(GM_KEY_HOOK_ENABLED, next);
     if (next) { injectPageHook(); alert("已启用页面钩子；在目标楼回一条任意内容即可自动记忆。"); }
     else alert("已关闭页面钩子。");
   }
 
-  // ========= 8) BV/AV 转换 & URL 解析 =========
+  // ========= BV/AV 转换 & rpid解析 =========
   const table = "FcwAPNKTMug3GV5Lj7EJnHpWsx4tb8haYeviqBz6rkCy12mUSDQX9RdoZf";
   const base = 58n, xor_val = 23442827791579n, mask = 2251799813685247n;
   const tr = new Map(Array.from(table).map((c,i)=>[c, BigInt(i)]));
@@ -469,7 +458,7 @@
   window.addEventListener("hashchange", tryCaptureRpidFromUrl);
   tryCaptureRpidFromUrl();
 
-  // ========= 9) 鉴权 & API 封装 =========
+  // ========= 鉴权 & API =========
   function getAuthTokens() {
     return new Promise((resolve, reject) => {
       const sessdata = GM_getValue(GM_KEY_SESSDATA, null);
@@ -513,7 +502,7 @@
     });
   }
 
-  // ========= 10) 发送（三模式；名单来自“分组聚合”） =========
+  // ========= 发送逻辑（三模式；名单来自“分组聚合”） =========
   async function sendTopLevelGroupComment() {
     const users = aggregateSelectedUsernames();
     if (users.length === 0) throw new Error("所选分组为空。");
@@ -587,8 +576,8 @@
     if (users.length === 0) throw new Error("所选分组为空。");
     const chunks = chunkBy(users, AT_LIMIT_PER_COMMENT);
 
-    const rootRpid = GM_getValue(GM_KEY_BIND_ROOT_RPID, null) || parseRpidFromText(location.href);
-    if (!rootRpid) {
+    const bound = GM_getValue(GM_KEY_BIND_ROOT_RPID, null) || parseRpidFromText(location.href);
+    if (!bound) {
       alert("未绑定 rpid，将回退为“中奖楼”模式。");
       return sendThreadSelfGroupComment();
     }
@@ -596,17 +585,17 @@
     const oid = getOidFromUrl();
     const { sessdata, csrf } = await getAuthTokens();
 
-    if (!confirm(`将在 rpid=${rootRpid} 的楼中楼分 ${chunks.length} 条发送 @。是否继续？`)) return;
+    if (!confirm(`将在 rpid=${bound} 的楼中楼分 ${chunks.length} 条发送 @。是否继续？`)) return;
 
     let ok = 0, fail = 0;
     const retries = Number(GM_getValue(GM_KEY_RETRY_TIMES, 3));
     const baseDelay = Number(GM_getValue(GM_KEY_RETRY_BASE_MS, 1200));
-    GM_notification({ title: "B站一键@", text: `开始在 rpid=${rootRpid} 的楼中楼发送`, timeout: 3000 });
+    GM_notification({ title: "B站一键@", text: `开始在 rpid=${bound} 的楼中楼发送`, timeout: 3000 });
 
     for (let i = 0; i < chunks.length; i++) {
       const msg = chunks[i].map((n) => `@${n}`).join(" ");
       try {
-        await withRetry(() => postAddReply({ sessdata, csrf, oid, message: msg, root: rootRpid, parent: rootRpid }), { retries, baseDelay });
+        await withRetry(() => postAddReply({ sessdata, csrf, oid, message: msg, root: bound, parent: bound }), { retries, baseDelay });
         ok++;
       } catch (e) {
         console.error(`第 ${i + 1} 条失败：`, e);
@@ -629,7 +618,7 @@
     }
   }
 
-  // ========= 11) 劫持头像（主楼 & 楼中楼）=========
+  // ========= 劫持评论框头像（主楼 & 楼中楼） =========
   function hookAllCommentBoxAvatars() {
     const host = document.querySelector("bili-comments");
     if (!host) return;
@@ -639,8 +628,8 @@
       boxes?.forEach((box) => {
         const sr = box.shadowRoot;
         const avatar = sr?.querySelector("#user-avatar");
-        if (avatar && !avatar.dataset.groupV38) {
-          avatar.dataset.groupV38 = "1";
+        if (avatar && !avatar.dataset.biliAtV40) {
+          avatar.dataset.biliAtV40 = "1";
           avatar.style.cursor = "pointer";
           avatar.addEventListener("click", (e) => {
             e.preventDefault(); e.stopPropagation();
@@ -659,8 +648,16 @@
   mo.observe(document.body, { childList: true, subtree: true });
   hookAllCommentBoxAvatars();
 
-  // ========= 12) 可选：页面钩子（自动记住 root/parent）=========
-  if (GM_getValue(GM_KEY_HOOK_ENABLED, false)) injectPageHook();
+  // ========= 地址栏 #reply/?reply 自动捕捉 rpid =========
+  function tryCaptureRpidFromUrl() {
+    const r = parseRpidFromText(location.href);
+    if (r) GM_setValue(GM_KEY_BIND_ROOT_RPID, r);
+  }
+  window.addEventListener("hashchange", tryCaptureRpidFromUrl);
+  tryCaptureRpidFromUrl();
+
+  // ========= 页面钩子（默认开启；仅关注 /x/v2/reply/add）=========
+  if (GM_getValue(GM_KEY_HOOK_ENABLED, true)) injectPageHook();
   function injectPageHook() {
     if (window.__BILI_AT_HOOK_INSTALLED__) return;
     window.__BILI_AT_HOOK_INSTALLED__ = true;
@@ -711,7 +708,7 @@
     window.addEventListener("__BILI_REPLY_ADD__", (e) => {
       try {
         const d = e.detail || {};
-        const root = d.root && /^\\d+$/.test(String(d.root)) ? Number(d.root) : null;
+        const root = d.root && /^\d+$/.test(String(d.root)) ? Number(d.root) : null;
         if (root) GM_setValue(GM_KEY_BIND_ROOT_RPID, root);
       } catch (_) {}
     }, false);
