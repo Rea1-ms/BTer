@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         B站评论一键@分组 (v3.0 - L1主楼+自动分片)
+// @name         B站评论一键@
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  【最终版】劫持主评论区(L1)头像，自动读取内容+@分组，自动按10人/条进行分片发送。不再需要UID。
+// @version      3.1
+// @description  【v3.1】劫持L1主头像，点击即发送@，自动按10人/条分片。设置时可直接粘贴@列表。
 // @author       Gemini & User
 // @match        https://www.bilibili.com/video/*
 // @grant        GM_xmlhttpRequest
@@ -20,15 +20,14 @@
 
   // --- 1. 存储键名 ---
   const GM_KEY_SESSDATA = "BILI_SESSDATA";
-  const GM_KEY_GROUP = "BILI_AT_GROUP_USERNAMES"; // 换了个新key，只存用户名
+  const GM_KEY_GROUP = "BILI_AT_GROUP_USERNAMES"; // 键名不变，内容还是用户名数组
   const AT_LIMIT_PER_COMMENT = 10; // B站API限制
 
   // --- 2. 分组与SESSDATA管理 (油猴菜单) ---
 
   GM_registerMenuCommand("1. 设置SESSDATA", setupSessdata);
-  GM_registerMenuCommand("2. 设置@分组 (仅用户名)", setupGroup);
+  GM_registerMenuCommand("2. 设置@分组 (粘贴@列表)", setupGroup);
 
-  // (setupSessdata 函数与 v2.0 完全相同)
   function setupSessdata() {
     let currentSessdata = GM_getValue(GM_KEY_SESSDATA, "");
     let input = prompt(
@@ -43,41 +42,44 @@
   }
 
   /**
-   * 【重大更新】菜单：设置@分组 (v3.0 纯用户名版)
+   * 菜单：设置@分组，使用@分割
    */
   function setupGroup() {
-    // 1. 读取旧数据（现在是字符串数组）
+    // 1. 读取旧数据（字符串数组），并转换为@格式的字符串
     let currentGroup = GM_getValue(GM_KEY_GROUP, []); // 格式: ['A', 'B', 'C']
+    let currentGroupString = currentGroup.map((name) => `@${name}`).join(" "); // "@A @B @C"
 
     // 2. 弹出输入框
     let inputString = prompt(
-      "【新】请输入@分组用户名，用【英文逗号,】分隔：\n(不再需要UID！)",
-      currentGroup.join(", "),
+      "【v3.1】请粘贴要@的用户名列表，用【@】分隔：\n(例如: @A@B@C 或者 @A @B @C)",
+      currentGroupString,
     );
 
     if (inputString === null) return; // 用户点击了"取消"
 
-    // 3. 解析用户输入
+    // 3. 使用正则表达式解析用户输入
     try {
-      const newGroup = inputString
-        .split(",")
-        .map((name) => name.trim()) // 去除 "名字" 前后的空格
-        .filter((name) => name.length > 0); // 过滤掉空字符串
+      // 正则 /@([^@]+)/g 匹配所有@符号开头、不包含下一个@的字符串
+      // match[1] 是捕获组 (用户名), .trim() 去除可能的空格
+      const newGroup = Array.from(inputString.matchAll(/@([^@]+)/g), (match) =>
+        match[1].trim(),
+      ).filter((name) => name.length > 0);
+
+      if (newGroup.length === 0 && inputString.length > 0) {
+        throw new Error("解析失败，未找到任何有效的@用户名。");
+      }
 
       // 4. 保存
       GM_setValue(GM_KEY_GROUP, newGroup);
       alert(
-        `分组保存成功！共 ${newGroup.length} 人。\n\n${newGroup.join(", ")}`,
+        `分组保存成功！共 ${newGroup.length} 人。\n\n${newGroup.map((name) => `@${name}`).join(" ")}`,
       );
     } catch (e) {
-      alert(
-        `保存失败！${e.message}\n\n请严格遵守 “名字1, 名字2, 名字3” 的格式。`,
-      );
+      alert(`保存失败！${e.message}\n\n请严格遵守 “@名字1@名字2” 的格式。`);
     }
   }
 
-  // --- 3. BV/AV 转换算法 (v2.0 最终版) ---
-  // (这部分代码与 v2.0 完全相同)
+  // --- 3. BV/AV 转换算法 ---
   const table = "FcwAPNKTMug3GV5Lj7EJnHpWsx4tb8haYeviqBz6rkCy12mUSDQX9RdoZf";
   const base = 58n;
   const xor_val = 23442827791579n;
@@ -100,10 +102,9 @@
 
   // --- 4. 核心：API请求 ---
 
-  // (getAuthTokens 函数与 v2.0 完全相同，依赖手动SESSDATA + 自动bili_jct)
   function getAuthTokens() {
     return new Promise((resolve, reject) => {
-      console.log("[Token Auth] 开始获取Auth Tokens (v3.0)...");
+      console.log("[Token Auth] 开始获取Auth Tokens (v3.1)...");
       const sessdata = GM_getValue(GM_KEY_SESSDATA, null);
       if (!sessdata) {
         return reject("未配置SESSDATA！请点击油猴菜单【1. 设置SESSDATA】。");
@@ -122,31 +123,16 @@
     });
   }
 
-  // 辅助函数：休眠
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  /**
-   * 【重大更新】发送评论 (v3.0 自动分片版)
-   * @param {Element} commentBoxShadowRoot - L1主评论框的 Shadow DOM 根
-   */
-  async function sendGroupComment(commentBoxShadowRoot) {
-    console.log("开始发送@分组评论 (v3.0)...");
+  // 发送评论
+
+  async function sendGroupComment() {
+    console.log("开始发送@分组评论 (v3.1)...");
     try {
-      // --- 1. 获取评论内容 ---
-      const editorSelector =
-        '.editor, .rich-text-area, div[contenteditable="true"]';
-      const editor = commentBoxShadowRoot.querySelector(editorSelector);
-      if (!editor) {
-        throw new Error(
-          `未找到L1主评论输入框！(尝试的选择器: ${editorSelector})`,
-        );
-      }
-      const base_message = editor.innerText.trim();
-      if (!base_message) {
-        throw new Error("评论内容不能为空！");
-      }
+      // --- 1. 不再获取评论内容 ---
 
       // --- 2. 获取@分组 (纯用户名) ---
       const group = GM_getValue(GM_KEY_GROUP, []);
@@ -170,28 +156,28 @@
       // --- 4. 获取认证信息 ---
       const { sessdata, csrf } = await getAuthTokens();
 
-      // --- 5. 【新】创建分片 (Chunks) ---
+      // --- 5. 创建分片 (Chunks) ---
       const chunks = [];
       for (let i = 0; i < group.length; i += AT_LIMIT_PER_COMMENT) {
         chunks.push(group.slice(i, i + AT_LIMIT_PER_COMMENT));
       }
       console.log(
-        `总共 ${group.length} 人, 将分为 ${chunks.length} 条评论发送 (每条 ${AT_LIMIT_PER_COMMENT} 人)。`,
+        `总共 ${group.length} 人, 将分为 ${chunks.length} 条评论发送。`,
       );
 
-      // --- 6. 【新】弹窗总确认 ---
+      // --- 6. 弹窗总确认 ---
       if (
         !confirm(
-          `【请确认】\n\n评论内容：\n${base_message}\n\n总@人数：${group.length} 人\n由于B站限制，将自动分为 ${chunks.length} 条评论发送。\n\n是否继续？`,
+          `【请确认】\n\n即将发送 ${group.length} 人的@\n将自动分为 ${chunks.length} 条评论发送。\n(评论内容将【只有】@名单)\n\n是否继续？`,
         )
       ) {
         console.log("用户取消了发送。");
         return;
       }
 
-      // --- 7. 【新】循环发送所有分片 ---
+      // --- 7. 循环发送所有分片 ---
       GM_notification({
-        title: "B站@分组",
+        title: "B站一键@",
         text: `开始发送... 共 ${chunks.length} 条评论。`,
         timeout: 3000,
       });
@@ -199,12 +185,14 @@
       let failCount = 0;
 
       for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i]; // 当前分片, e.g., ['A', 'B', ..., 'J']
+        const chunk = chunks[i]; // e.g., ['A', 'B', ..., 'J']
         const at_names_text = chunk.map((name) => `@${name}`).join(" "); // "@A @B ... @J"
-        const final_message = `${base_message} ${at_names_text}`;
+
+        // 最终消息 = 只有@名单
+        const final_message = at_names_text;
 
         console.log(
-          `正在发送第 ${i + 1} / ${chunks.length} 条: ${at_names_text}`,
+          `正在发送第 ${i + 1} / ${chunks.length} 条: ${final_message}`,
         );
 
         const params = new URLSearchParams();
@@ -215,7 +203,6 @@
         params.append("csrf", csrf);
         params.append("root", "0");
         params.append("parent", "0");
-        // 【关键】不再包含 at_name_to_mid 字段
 
         try {
           await new Promise((resolve, reject) => {
@@ -248,69 +235,55 @@
         } catch (e) {
           failCount++;
           GM_notification({
-            title: "B站@分组",
+            title: "B站一键@",
             text: `第 ${i + 1} 条发送失败: ${e.message}`,
             timeout: 4000,
           });
         }
 
-        // 在两次请求之间增加一个短暂的延迟，防止被风控
         if (i < chunks.length - 1) {
-          await sleep(1500); // 休眠1.5秒
+          await sleep(1500); // 休眠1.5秒, 防止风控
         }
       }
 
       // --- 8. 最终总结 ---
       GM_notification({
-        title: "B站@分组",
+        title: "B站一键@",
         text: `全部发送完毕！\n成功: ${successCount} 条\n失败: ${failCount} 条`,
         timeout: 5000,
       });
-
-      if (successCount > 0) {
-        editor.innerHTML = ""; // 只要有成功的，就清空评论框
-      }
     } catch (err) {
       console.error("发送评论时出错:", err);
       GM_notification({
-        title: "B站@分组",
+        title: "B站一键@",
         text: `发送失败: ${err.message}`,
         timeout: 5000,
       });
     }
   }
 
-  // --- 5. 【重大更新】劫持 L1 主楼按钮 ---
+  // --- 5. 劫持 L1 主楼按钮 ---
   const observer = new MutationObserver((mutations, obs) => {
     try {
-      // 1. 找到评论根组件
       const commentsApp = document.querySelector("bili-comments");
       if (!commentsApp) return;
-
-      // 2. 钻入 Shadow DOM 找到【L1 评论区头部】
       const header = commentsApp.shadowRoot?.querySelector(
         "bili-comments-header-renderer",
       );
       if (!header) return;
-
-      // 3. 钻入 Shadow DOM 找到【L1 评论框】
       const commentBox = header.shadowRoot?.querySelector("bili-comment-box");
       if (!commentBox) return;
-
       const commentBoxShadowRoot = commentBox.shadowRoot;
       if (!commentBoxShadowRoot) return;
-
-      // 4. 钻入 Shadow DOM 找到【L1 头像】
       const avatar = commentBoxShadowRoot.querySelector("#user-avatar");
       if (!avatar) return;
 
-      // 防止重复绑定
-      if (avatar.dataset.geminiLoadedV3) {
+      if (avatar.dataset.geminiLoadedV31) {
         return;
       }
-      avatar.dataset.geminiLoadedV3 = "true";
+      avatar.dataset.geminiLoadedV31 = "true";
 
-      console.log("【v3.0】成功找到 L1 主评论区头像，准备劫持...");
+      console.log("成功找到 L1 主评论区头像，准备劫持...");
 
       GM_addStyle(
         "#user-avatar { cursor: pointer !important; transform: scale(1.1); transition: transform 0.2s; } #user-avatar:hover { opacity: 0.8; }",
@@ -320,26 +293,23 @@
         e.preventDefault();
         e.stopPropagation();
 
-        // 【新】调用最终的发送函数
-        sendGroupComment(commentBoxShadowRoot);
+        sendGroupComment();
       });
 
       GM_notification({
-        title: "B站@分组脚本",
-        text: "“劫持”L1头像按钮成功！(v3.0)",
+        title: "B站一键@脚本",
+        text: "“劫持”L1头像按钮成功！(v3.1)",
         timeout: 3000,
       });
 
-      // 找到后我们就可以停止观察了，主评论框一般不会销毁
       obs.disconnect();
-      console.log("【v3.0】已劫持L1头像，停止观察 DOM。");
+      console.log("【v3.1】已劫持L1头像，停止观察 DOM。");
     } catch (e) {
-      // 捕获钻 Shadow DOM 时可能发生的错误
       console.warn("在搜寻L1头像时出错: ", e);
     }
   });
 
-  console.log("B站@分组脚本：开始观察页面... (v3.0)");
+  console.log("B站一键@脚本：开始观察页面... (v3.1)");
   observer.observe(document.body, {
     childList: true,
     subtree: true,
