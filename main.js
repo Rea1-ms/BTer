@@ -51,7 +51,7 @@
 
     // 2. 弹出输入框
     let inputString = prompt(
-      "【v3.1】请粘贴要@的用户名列表，用【@】分隔：\n(例如: @A@B@C 或者 @A @B @C)",
+      "请粘贴要@的用户名列表，用【@】分隔：\n(例如: @A@B@C 或者 @A @B @C)",
       currentGroupString,
     );
 
@@ -104,7 +104,7 @@
 
   function getAuthTokens() {
     return new Promise((resolve, reject) => {
-      console.log("[Token Auth] 开始获取Auth Tokens (v3.1)...");
+      console.log("[Token Auth] 开始获取Auth Tokens...");
       const sessdata = GM_getValue(GM_KEY_SESSDATA, null);
       if (!sessdata) {
         return reject("未配置SESSDATA！请点击油猴菜单【1. 设置SESSDATA】。");
@@ -130,7 +130,7 @@
   // 发送评论
 
   async function sendGroupComment() {
-    console.log("开始发送@分组评论 (v3.1)...");
+    console.log("开始发送@分组评论...");
     try {
       // --- 1. 不再获取评论内容 ---
 
@@ -298,18 +298,18 @@
 
       GM_notification({
         title: "B站一键@脚本",
-        text: "“劫持”L1头像按钮成功！(v3.1)",
+        text: "“劫持”L1头像按钮成功！",
         timeout: 3000,
       });
 
       obs.disconnect();
-      console.log("【v3.1】已劫持L1头像，停止观察 DOM。");
+      console.log("已劫持L1头像，停止观察 DOM。");
     } catch (e) {
       console.warn("在搜寻L1头像时出错: ", e);
     }
   });
 
-  console.log("B站一键@脚本：开始观察页面... (v3.1)");
+  console.log("B站一键@脚本：开始观察页面...");
   observer.observe(document.body, {
     childList: true,
     subtree: true,
