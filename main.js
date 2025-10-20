@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         B站评论一键@（自动选择 / 多分组 / 中奖楼 / 绑定楼 / 页面钩子）
+// @name         B站评论一键@（自动/手动 / 多分组 / 中奖楼 / 绑定楼 / 页面钩子 / L1-L2明确分流）
 // @namespace    https://tampermonkey.net/
-// @version      4.2
-// @description  一键@：自动选择模式（默认）—若URL含#reply或你刚回过某楼则在该楼中楼发送，否则回退中奖楼；支持多分组、顶层直发、占楼→延迟→楼中楼@（含重试）、页面钩子仅拦截 reply/add 参数；rpid临时保存，用完即丢、刷新即清。每条最多@10人，自动分片。
+// @version      4.4
+// @description  一键@：支持自动/手动选择发送位置；L2（楼中楼按钮）沿用“#reply 或 最近回楼钩子→绑定楼发送→否则回退中奖楼”的明确提示；L1（视频下主评论框按钮）不看链接，直接询问“顶层直发”或“中奖楼（占楼→楼中楼@）”。支持多分组、去重、导入导出、占楼延迟与重试。页面钩子仅拦截 /x/v2/reply/add，用完即丢、刷新即清。每条最多@10人自动分片。**注意：rpid仅通过API返回或网络钩子获得，绝不从DOM读取。**
 // @author       GPT-5 Pro & Gemini-2.5 Pro & User
 // @match        https://www.bilibili.com/video/*
 // @grant        GM_xmlhttpRequest
@@ -17,8 +17,6 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-/* eslint-env browser, es2020 */
-/* global GM_xmlhttpRequest, GM_cookie, GM_notification, GM_addStyle, GM_setValue, GM_getValue, GM_registerMenuCommand, GM_setClipboard, GM_unregisterMenuCommand */
 
 (function () {
   "use strict";
@@ -26,7 +24,7 @@
   // ========= 常量 & 键名 =========
   const AT_LIMIT_PER_COMMENT = 10;
 
-  // 设置 / 模式
+  // 设置 / 模式（沿用 4.x 键）
   const GM_KEY_SESSDATA = "BILI_SESSDATA";
   const GM_KEY_MODE = "BILI_AT_REPLY_MODE";          // 手动模式：'top'|'threadSelf'|'threadBind'
   const GM_KEY_AUTO_MODE = "BILI_AT_AUTO_MODE";      // 自动选择模式 开/关（默认true）
@@ -44,9 +42,9 @@
 
   const ReplyMode = { TOP: "top", THREAD_SELF: "threadSelf", THREAD_BIND: "threadBind" };
 
-  // ========= 初始化（默认） =========
-  if (!GM_getValue(GM_KEY_MODE)) GM_setValue(GM_KEY_MODE, ReplyMode.THREAD_SELF); // 手动默认=中奖楼
-  if (GM_getValue(GM_KEY_AUTO_MODE) == null) GM_setValue(GM_KEY_AUTO_MODE, true); // 自动开启
+  // ========= 初始化默认值 =========
+  if (!GM_getValue(GM_KEY_MODE)) GM_setValue(GM_KEY_MODE, ReplyMode.THREAD_SELF);
+  if (GM_getValue(GM_KEY_AUTO_MODE) == null) GM_setValue(GM_KEY_AUTO_MODE, true);
   if (!GM_getValue(GM_KEY_THREAD_PREFIX)) GM_setValue(GM_KEY_THREAD_PREFIX, "中奖名单：");
   if (GM_getValue(GM_KEY_THREAD_DELAY_MS) == null) GM_setValue(GM_KEY_THREAD_DELAY_MS, 2500);
   if (GM_getValue(GM_KEY_RETRY_TIMES) == null) GM_setValue(GM_KEY_RETRY_TIMES, 3);
@@ -55,22 +53,16 @@
   if (!GM_getValue(GM_KEY_GROUPS)) GM_setValue(GM_KEY_GROUPS, {});
   if (!GM_getValue(GM_KEY_GROUP_ORDER)) GM_setValue(GM_KEY_GROUP_ORDER, []);
   if (GM_getValue(GM_KEY_DEDUP) == null) GM_setValue(GM_KEY_DEDUP, true);
-  if (!GM_getValue(GM_KEY_ACTIVE_GROUPS)) GM_setValue(GM_KEY_ACTIVE_GROUPS, []); // 初始未选择
+  if (!GM_getValue(GM_KEY_ACTIVE_GROUPS)) GM_setValue(GM_KEY_ACTIVE_GROUPS, []);
 
   // ========= rpid：仅会话内临时保存（用完即丢）=========
   let sessionBind = { rpid: null, source: null }; // source='url'|'hook'
+  function setSessionBind(rpid, source) { sessionBind = { rpid: Number(rpid) || null, source: source || null }; }
+  function clearSessionBind() { sessionBind = { rpid: null, source: null }; }
 
-  function setSessionBind(rpid, source) {
-    sessionBind = { rpid: Number(rpid) || null, source: source || null };
-  }
-  function clearSessionBind() {
-    sessionBind = { rpid: null, source: null };
-  }
-
-  // ========= 菜单（动态标签，支持刷新）=========
+  // ========= 菜单（保留原功能）=========
   let menuIds = [];
   function registerMenu() {
-    // 尝试清理旧菜单（若环境支持）
     if (typeof GM_unregisterMenuCommand === "function" && Array.isArray(menuIds)) {
       for (const id of menuIds) { try { GM_unregisterMenuCommand(id); } catch (_) {} }
       menuIds = [];
@@ -99,7 +91,8 @@
     menuIds.push(GM_registerMenuCommand(`8. 模式（手动）：切换（当前：${manualMode === "top" ? "顶层直发" : manualMode === "threadSelf" ? "楼中楼-中奖楼" : "绑定楼"}）`, switchManualMode));
     menuIds.push(GM_registerMenuCommand("9. 中奖楼：占楼文案 / 延迟 / 重试设置", setupThreadConfig));
     menuIds.push(GM_registerMenuCommand(`10. 页面钩子：启 / 停（当前：${hookOn ? "开" : "关"}）`, togglePageHook));
-    menuIds.push(GM_registerMenuCommand("11. 立即执行一键@（按当前模式+分组）", () => routeSend({ source: "menu" })));
+    // 菜单触发：保持原自动/手动路由，不参与 L1/L2 分流
+    menuIds.push(GM_registerMenuCommand("11. 立即执行一键@（按当前模式+分组）", () => routeMenuSend()));
   }
   registerMenu();
 
@@ -122,12 +115,7 @@
     return list.map((n) => n.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, "").trim()).filter(Boolean);
   }
 
-  function chunkBy(arr, size) {
-    const out = [];
-    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-    return out;
-  }
-
+  function chunkBy(arr, size) { const out = []; for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size)); return out; }
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   async function withRetry(taskFn, { retries = 3, baseDelay = 1200, factor = 1.8 } = {}) {
@@ -408,7 +396,7 @@
     registerMenu();
   }
 
-  // ========= BV/AV 转换 & rpid 解析 =========
+  // ========= BV/AV 转换 & rpid 解析（沿用稳定算法）=========
   const table = "FcwAPNKTMug3GV5Lj7EJnHpWsx4tb8haYeviqBz6rkCy12mUSDQX9RdoZf";
   const base = globalThis.BigInt(58);
   const xor_val = globalThis.BigInt("23442827791579");
@@ -437,8 +425,8 @@
     if (!s) return null;
     const text = String(s);
     const regs = [
-      /#reply(\d{5,})/i,                           // 优先解析 #reply123...
-      /[#?&](?:reply|rpid|root|parent)=?(\d{5,})/i // 其次解析 query 形式
+      /#reply(\d{5,})/i,                           // #reply123...
+      /[#?&](?:reply|rpid|root|parent)=?(\d{5,})/i // query 形式
     ];
     for (const re of regs) {
       const m = text.match(re);
@@ -447,7 +435,7 @@
     return null;
   }
 
-  // 初次进入/锚点变化：仅根据 URL 记一次；无锚则清空
+  // 初次进入/锚点变化：仅根据 URL 记一次；无锚则清空（后续钩子仍可写入）
   function syncSessionBindFromUrl() {
     const r = parseRpidFromText(location.href);
     if (r) setSessionBind(r, "url"); else clearSessionBind();
@@ -499,7 +487,7 @@
     });
   }
 
-  // ========= 发送逻辑 =========
+  // ========= 发送逻辑（保留原功能）=========
   async function sendTopLevelGroupComment() {
     const users = aggregateSelectedUsernames();
     if (users.length === 0) throw new Error("所选分组为空。");
@@ -543,6 +531,7 @@
 
     GM_notification({ title: "B站一键@", text: "正在占楼...", timeout: 3000 });
     const occupyRes = await postAddReply({ sessdata, csrf, oid, message: prefix, root: 0, parent: 0 });
+    // rpid 仅从 API 返回中获取
     const rootRpid = occupyRes?.data?.rpid || occupyRes?.data?.reply?.rpid;
     if (!rootRpid) throw new Error("占楼成功但未拿到 rpid。");
 
@@ -594,7 +583,7 @@
       if (i < chunks.length - 1) await sleep(1500);
     }
 
-    // —— 用完即丢：清空 session & 移除 #reply 避免误连发
+    // 用完即丢：若本次是通过 #reply 触发，移除锚，且清空绑定
     const hashRpid = parseRpidFromText(location.href);
     if (hashRpid === Number(rpid)) {
       try { history.replaceState(null, "", location.pathname + location.search); } catch (_) {}
@@ -604,12 +593,44 @@
     GM_notification({ title: "B站一键@", text: `完成：成功 ${ok} / 失败 ${fail}`, timeout: 5000 });
   }
 
-  // ========= 路由（自动 / 手动）=========
-  async function routeSend({ sourceEl, source = "avatar" }) {
+  // ========= 路由（分类：L1 / L2 / 菜单）=========
+  async function routeL1PromptSend() {
+    // L1：不看链接、不用绑定楼，直接二选一
+    const choice = prompt(
+      "【选择发送层级（L1 主评论区）】\n  1 = 顶层直发（主楼）\n  2 = 楼中楼（中奖楼：占楼→楼中楼@）\n\n请输入序号：",
+      "2"
+    );
+    if (choice === null) return;
+    const c = choice.trim();
+    if (c === "1") return sendTopLevelGroupComment();
+    if (c === "2") return sendThreadSelfGroupComment();
+    alert("已取消或输入无效。");
+  }
+
+  async function routeL2Send() {
+    // L2：沿用原“自动/手动路由”
+    const auto = !!GM_getValue(GM_KEY_AUTO_MODE, true);
+    if (auto) await routeAutoSend();
+    else await routeManualSend();
+  }
+
+  async function routeMenuSend() {
     try {
       const auto = !!GM_getValue(GM_KEY_AUTO_MODE, true);
       if (auto) await routeAutoSend();
       else await routeManualSend();
+    } catch (err) {
+      console.error("发送出错：", err);
+      GM_notification({ title: "B站一键@", text: `发送失败：${err.message}`, timeout: 5000 });
+    }
+  }
+
+  async function routeSend({ level, source } = {}) {
+    try {
+      if (source === "menu") return routeMenuSend();
+      if (level === "L1") return routeL1PromptSend();
+      // 默认按 L2 处理（楼中楼按钮）
+      return routeL2Send();
     } catch (err) {
       console.error("发送出错：", err);
       GM_notification({ title: "B站一键@", text: `发送失败：${err.message}`, timeout: 5000 });
@@ -629,9 +650,7 @@
   }
 
   async function routeAutoSend() {
-    // 优先：#reply（URL）或最近一次“测试回复”（页面钩子）
-    // - 若 URL 含 #reply：直接提示“将绑定楼发送”
-    // - 若无 #reply 但钩子捕捉到 root：提示“检测到你刚回复过的楼，将绑定楼发送”；否则回退中奖楼并提示可先发一条获取绑定
+    // 先看 URL #reply，再看最近一次“你主动回楼”的钩子；都没有则回退中奖楼
     const rpidFromUrl = parseRpidFromText(location.href);
     if (rpidFromUrl) {
       const ok = confirm(`检测到 URL 含 #reply（rpid=${rpidFromUrl}）。\n将绑定该楼的楼中楼发送 @，是否继续？`);
@@ -650,37 +669,76 @@
     return sendThreadSelfGroupComment();
   }
 
-  // ========= 劫持评论框头像（主楼 & 楼中楼） =========
-  function hookAllCommentBoxAvatars() {
-    const host = document.querySelector("bili-comments");
-    if (!host) return;
+  // ========= L1 / L2 明确分流的头像劫持 =========
+
+  // 判断某个 bili-comment-box 是否处于 L1（主评论区头部）
+  function isBoxUnderHeader(boxEl) {
+    try {
+      let node = boxEl;
+      for (let i = 0; i < 10 && node && node.getRootNode; i++) {
+        const root = node.getRootNode();
+        const host = root && root.host;
+        if (!host) break;
+        const name = (host.tagName || host.localName || "").toString().toUpperCase();
+        if (name === "BILI-COMMENTS-HEADER-RENDERER") return true; // L1
+        node = host;
+      }
+    } catch (_) {}
+    return false; // 非头部即视为 L2
+  }
+
+  // 遍历整个评论区所有 bili-comment-box，并分别挂接 L1/L2 的点击逻辑
+  function hookAllCommentBoxAvatarsSplit() {
+    const app = document.querySelector("bili-comments");
+    if (!app || !app.shadowRoot) return;
+
+    const seen = new WeakSet();
+
     function dfs(root) {
       if (!root) return;
+
+      // 找到本层的所有 bili-comment-box
       const boxes = root.querySelectorAll?.("bili-comment-box");
       boxes?.forEach((box) => {
+        if (seen.has(box)) return;
+        seen.add(box);
+
         const sr = box.shadowRoot;
         const avatar = sr?.querySelector("#user-avatar");
-        if (avatar && !avatar.dataset.biliAtV42) {
-          avatar.dataset.biliAtV42 = "1";
-          avatar.style.cursor = "pointer";
-          avatar.addEventListener("click", (e) => {
-            e.preventDefault(); e.stopPropagation();
-            routeSend({ sourceEl: avatar, source: "avatar" });
-          });
-        }
+        if (!avatar) return;
+
+        const isL1 = isBoxUnderHeader(box);
+        const flag = isL1 ? "biliAtV44L1" : "biliAtV44L2";
+        if (avatar.dataset[flag]) return;
+
+        avatar.dataset[flag] = "1";
+        avatar.style.cursor = "pointer";
+        avatar.addEventListener("click", (e) => {
+          e.preventDefault(); e.stopPropagation();
+          routeSend({ level: isL1 ? "L1" : "L2" });
+        });
       });
+
+      // 递归进入所有子元素的 shadowRoot
       const all = root.querySelectorAll?.("*");
       all?.forEach((el) => el.shadowRoot && dfs(el.shadowRoot));
     }
-    dfs(host.shadowRoot);
+
+    dfs(app.shadowRoot);
   }
 
+  // 样式（沿用）
   GM_addStyle(`#user-avatar{cursor:pointer!important;transform:scale(1.1);transition:transform .2s;}#user-avatar:hover{opacity:.8;}`);
-  const mo = new MutationObserver(() => { try { hookAllCommentBoxAvatars(); } catch (e) {} });
-  mo.observe(document.body, { childList: true, subtree: true });
-  hookAllCommentBoxAvatars();
 
-  // ========= 页面钩子（默认开启；仅关注 /x/v2/reply/add）=========
+  // 观察 DOM 变动，持续挂接（避免“共享主楼按钮”的误判）
+  const mo = new MutationObserver(() => {
+    try { hookAllCommentBoxAvatarsSplit(); } catch (e) {}
+  });
+  mo.observe(document.body, { childList: true, subtree: true });
+  // 初次尝试
+  hookAllCommentBoxAvatarsSplit();
+
+  // ========= 页面钩子（默认开启；仅关注 /x/v2/reply/add；不从DOM取rpid）=========
   if (GM_getValue(GM_KEY_HOOK_ENABLED, true)) injectPageHook();
   function injectPageHook() {
     if (window.__BILI_AT_HOOK_INSTALLED__) return;
@@ -703,11 +761,15 @@
               const p=new URLSearchParams(String(t));
               const root = p.get('root'); const parent = p.get('parent');
               if (root && parent && root === parent && /^\\d+$/.test(root)) {
+                // 仅当用户“主动回楼”时，root=parent=该楼rpid
                 emit({root: root, from: 'hook'});
               }
               this.addEventListener('readystatechange',function(){
                 if(this.readyState===4&&this.status===200){
-                  try{const r=JSON.parse(this.responseText); if(r?.data?.rpid) emit({rpid:String(r.data.rpid),ok:true});}catch(_){}
+                  try{
+                    const r=JSON.parse(this.responseText);
+                    if(r?.data?.rpid){ emit({rpid:String(r.data.rpid),ok:true}); }
+                  }catch(_){}
                 }
               });
             }
@@ -736,7 +798,7 @@
     (document.head || document.documentElement).appendChild(s);
     s.remove();
 
-    // 脚本侧接收：记住最近一次“用户主动回楼”的 root
+    // 内容脚本侧：仅接收“root”事件来记忆最近回楼；不尝试从DOM解析 rpid
     window.addEventListener("__BILI_REPLY_ADD__", (e) => {
       try {
         const d = e.detail || {};
